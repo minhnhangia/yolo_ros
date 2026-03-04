@@ -144,14 +144,14 @@ def generate_launch_description():
         input_image_topic = LaunchConfiguration("input_image_topic")
         input_image_topic_cmd = DeclareLaunchArgument(
             "input_image_topic",
-            default_value="/camera/rgb/image_raw",
+            default_value="/tello7/image_raw",
             description="Name of the input image topic",
         )
 
         image_reliability = LaunchConfiguration("image_reliability")
         image_reliability_cmd = DeclareLaunchArgument(
             "image_reliability",
-            default_value="1",
+            default_value="2",
             choices=["0", "1", "2"],
             description="Specific reliability QoS of the input image topic (0=system default, 1=Reliable, 2=Best Effort)",
         )
@@ -334,7 +334,7 @@ def generate_launch_description():
     use_tracking = LaunchConfiguration("use_tracking")
     use_tracking_cmd = DeclareLaunchArgument(
         "use_tracking",
-        default_value="True",
+        default_value="False",
         description="Whether to activate tracking",
     )
 
