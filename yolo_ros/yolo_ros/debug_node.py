@@ -86,9 +86,11 @@ class DebugNode(LifecycleNode):
         )
 
         # Pubs
-        self._dbg_pub = self.create_publisher(Image, "dbg_image", 10)
-        self._bb_markers_pub = self.create_publisher(MarkerArray, "dgb_bb_markers", 10)
-        self._kp_markers_pub = self.create_publisher(MarkerArray, "dgb_kp_markers", 10)
+        self._dbg_pub = self.create_publisher(
+            Image, "yolo/dbg_image", qos_profile=self.image_qos_profile
+        )
+        self._bb_markers_pub = self.create_publisher(MarkerArray, "yolo/dgb_bb_markers", 10)
+        self._kp_markers_pub = self.create_publisher(MarkerArray, "yolo/dgb_kp_markers", 10)
 
         super().on_configure(state)
         self.get_logger().info(f"[{self.get_name()}] Configured")
@@ -433,6 +435,12 @@ class DebugNode(LifecycleNode):
         @param img_msg Image message
         @param detection_msg Detections message
         """
+        has_dbg_sub = self._dbg_pub.get_subscription_count() > 0
+        has_bb_sub = self._bb_markers_pub.get_subscription_count() > 0
+        has_kp_sub = self._kp_markers_pub.get_subscription_count() > 0
+        if not (has_dbg_sub or has_bb_sub or has_kp_sub):
+            return
+
         cv_image = self.cv_bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
         bb_marker_array = MarkerArray()
         kp_marker_array = MarkerArray()
@@ -451,17 +459,18 @@ class DebugNode(LifecycleNode):
 
             color = self._class_to_color[class_name]
 
-            cv_image = self.draw_box(cv_image, detection, color)
-            cv_image = self.draw_mask(cv_image, detection, color)
-            cv_image = self.draw_keypoints(cv_image, detection)
+            if has_dbg_sub:
+                cv_image = self.draw_box(cv_image, detection, color)
+                cv_image = self.draw_mask(cv_image, detection, color)
+                cv_image = self.draw_keypoints(cv_image, detection)
 
-            if detection.bbox3d.frame_id:
+            if detection.bbox3d.frame_id and has_bb_sub:
                 marker = self.create_bb_marker(detection, color)
                 marker.header.stamp = img_msg.header.stamp
                 marker.id = len(bb_marker_array.markers)
                 bb_marker_array.markers.append(marker)
 
-            if detection.keypoints3d.frame_id:
+            if detection.keypoints3d.frame_id and has_kp_sub:
                 for kp in detection.keypoints3d.data:
                     marker = self.create_kp_marker(kp)
                     marker.header.frame_id = detection.keypoints3d.frame_id
@@ -469,12 +478,16 @@ class DebugNode(LifecycleNode):
                     marker.id = len(kp_marker_array.markers)
                     kp_marker_array.markers.append(marker)
 
-        # Publish dbg image
-        self._dbg_pub.publish(
-            self.cv_bridge.cv2_to_imgmsg(cv_image, encoding="bgr8", header=img_msg.header)
-        )
-        self._bb_markers_pub.publish(bb_marker_array)
-        self._kp_markers_pub.publish(kp_marker_array)
+        if has_dbg_sub:
+            self._dbg_pub.publish(
+                self.cv_bridge.cv2_to_imgmsg(cv_image, encoding="bgr8", header=img_msg.header)
+            )
+            
+        if has_bb_sub:
+            self._bb_markers_pub.publish(bb_marker_array)
+            
+        if has_kp_sub:
+            self._kp_markers_pub.publish(kp_marker_array)
 
 
 def main():
