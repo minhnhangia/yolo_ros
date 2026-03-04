@@ -4,9 +4,11 @@ Drone detector node for YOLO-based drone avoidance.
 
 Subscribes to YOLO detections and identifies when another drone has been
 consistently visible with high confidence across many consecutive frames.
-When confirmed, publishes the drone's horizontal position in the frame
-(left / right) so mission_control can react accordingly.
+When confirmed *and* close enough (bbox area ≥ threshold), publishes the
+drone's horizontal position (left / right) so mission_control can react.
 """
+
+from typing import Optional
 
 import rclpy
 from rclpy.node import Node
@@ -17,8 +19,13 @@ from rclpy.qos import (
     QoSReliabilityPolicy,
 )
 
-from std_msgs.msg import String
-from yolo_msgs.msg import DetectionArray
+from yolo_msgs.msg import Detection, DetectionArray, DroneDetection
+
+# Lookup table: message constant → human-readable label for logging.
+_POSITION_LABELS = {
+    DroneDetection.POSITION_LEFT: "left",
+    DroneDetection.POSITION_RIGHT: "right",
+}
 
 
 class DroneDetectorNode(Node):
@@ -35,12 +42,12 @@ class DroneDetectorNode(Node):
         How many frames in a row the drone must be seen before publishing
         (default ``3``).
     image_width : int
-        Assumed image width in pixels, used to compute left/mid/right
-        (default ``478``).
+        Camera image width in pixels, used to split left / right
+        (default ``648``).
+    area_threshold : float
+        Minimum bounding-box area (px²) to classify as *near*
+        (default ``2500.0``).
     """
-
-
-    # 648 x 478
 
     def __init__(self) -> None:
         super().__init__("drone_detector_node")
@@ -52,27 +59,27 @@ class DroneDetectorNode(Node):
         self.declare_parameter("image_width", 648)
         self.declare_parameter("area_threshold", 2500.0)
 
-        self.target_class: str = (
+        self._target_class: str = (
             self.get_parameter("target_class")
             .get_parameter_value()
             .string_value
         )
-        self.confidence_threshold: float = (
+        self._confidence_threshold: float = (
             self.get_parameter("confidence_threshold")
             .get_parameter_value()
             .double_value
         )
-        self.consecutive_frames: int = (
+        self._consecutive_frames: int = (
             self.get_parameter("consecutive_frames")
             .get_parameter_value()
             .integer_value
         )
-        self.image_width: int = (
+        self._image_width: int = (
             self.get_parameter("image_width")
             .get_parameter_value()
             .integer_value
         )
-        self.area_threshold: float = (
+        self._area_threshold: float = (
             self.get_parameter("area_threshold")
             .get_parameter_value()
             .double_value
@@ -96,97 +103,114 @@ class DroneDetectorNode(Node):
         )
 
         # ── Pub / Sub ──────────────────────────────────────────────────
-        self.sub = self.create_subscription(
+        self._sub = self.create_subscription(
             DetectionArray,
             "yolo/detections",
-            self._detection_callback,
+            self._detection_cb,
             sensor_qos,
         )
-
-        self.pub = self.create_publisher(
-            String,
+        self._pub = self.create_publisher(
+            DroneDetection,
             "yolo/drone_detected",
             reliable_qos,
         )
 
         self.get_logger().info(
-            f"DroneDetectorNode started — looking for '{self.target_class}' "
-            f"with score ≥ {self.confidence_threshold} "
-            f"for {self.consecutive_frames} consecutive frames "
-            f"area_threshold={self.area_threshold:.0f}px²"
+            f"DroneDetectorNode started — looking for '{self._target_class}' "
+            f"with score ≥ {self._confidence_threshold} "
+            f"for {self._consecutive_frames} consecutive frames "
+            f"area_threshold={self._area_threshold:.0f}px²"
         )
 
     # ════════════════════════════════════════════════════════════════════
-    # CALLBACK
+    # Helpers
     # ════════════════════════════════════════════════════════════════════
 
-    def _detection_callback(self, msg: DetectionArray) -> None:
+    def _best_target_detection(
+        self, detections: list
+    ) -> Optional[Detection]:
+        """Return the highest-scoring detection matching the target class,
+        or ``None`` if no detection meets the confidence threshold."""
+        best: Optional[Detection] = None
+        for det in detections:
+            if (
+                det.class_name == self._target_class
+                and det.score >= self._confidence_threshold
+                and (best is None or det.score > best.score)
+            ):
+                best = det
+        return best
+
+    @staticmethod
+    def _bbox_area(det: Detection) -> float:
+        """Compute bounding-box area in px²."""
+        return det.bbox.size.x * det.bbox.size.y
+
+    def _classify_position(self, cx: float) -> int:
+        """Map centre-x to a ``DroneDetection.POSITION_*`` constant."""
+        half = self._image_width / 2.0
+        if cx < half:
+            return DroneDetection.POSITION_LEFT
+        return DroneDetection.POSITION_RIGHT
+
+    def _classify_distance(self, area: float) -> int:
+        """Map bbox area to a ``DroneDetection.DISTANCE_*`` constant."""
+        if area >= self._area_threshold:
+            return DroneDetection.DISTANCE_NEAR
+        return DroneDetection.DISTANCE_FAR
+
+    # ════════════════════════════════════════════════════════════════════
+    # Callback
+    # ════════════════════════════════════════════════════════════════════
+
+    def _detection_cb(self, msg: DetectionArray) -> None:
         """Process a single frame of YOLO detections."""
 
-        # Find the best-scoring drone detection in this frame
-        best_det = None
-        best_score = 0.0
-        for det in msg.detections:
-            if (
-                det.class_name == self.target_class
-                and det.score >= self.confidence_threshold
-                and det.score > best_score
-            ):
-                best_det = det
-                best_score = det.score
+        best = self._best_target_detection(msg.detections)
 
-        if best_det is None:
-            # No qualifying drone in this frame → reset streak
+        if best is None:
             self._consecutive_count = 0
             return
 
         self._consecutive_count += 1
+        area = self._bbox_area(best)
 
-        bbox_area = best_det.bbox.size.x * best_det.bbox.size.y
         self.get_logger().info(
             f"Drone detected: frame {self._consecutive_count}"
-            f"/{self.consecutive_frames}  score={best_score:.2f}"
-            f"  area={bbox_area:.0f}px²"
+            f"/{self._consecutive_frames}  score={best.score:.2f}"
+            f"  area={area:.0f}px²"
         )
 
-        if self._consecutive_count < self.consecutive_frames:
+        if self._consecutive_count < self._consecutive_frames:
             return
 
-        # ── Confirmed: compute horizontal position ──────────────────
-        cx = best_det.bbox.center.position.x  # centre-x in pixels
-        half = self.image_width / 2.0
+        # ── Streak reached — classify & gate on distance ────────────
+        distance = self._classify_distance(area)
+        if distance != DroneDetection.DISTANCE_NEAR:
+            self._consecutive_count = 0
+            return
 
-        if cx < half:
-            position = "left"
-        else:
-            position = "right"
+        position = self._classify_position(best.bbox.center.position.x)
 
-        # ── Compute area from bbox size → near / far ────────────────
-        bbox_w = best_det.bbox.size.x
-        bbox_h = best_det.bbox.size.y
-        area = bbox_w * bbox_h
-        
-        if area >= self.area_threshold:
-            distance = "near"
-        else:
-            distance = "far"
+        out_msg = DroneDetection()
+        out_msg.position = position
+        out_msg.distance = distance
+        out_msg.score = best.score
+        out_msg.bbox_area = area
+        self._pub.publish(out_msg)
 
-        if distance == "near":
-            out_msg = String()
-            out_msg.data = f"{position}"
-            self.pub.publish(out_msg)
-
-            self.get_logger().warning(
-                f"DRONE CONFIRMED ({self.consecutive_frames} frames) — "
-                f"position: {position}, area: {area:.0f}px²"
-                f"(cx={cx:.0f}, area={area:.0f}px²)"
+        self.get_logger().warning(
+            f"DRONE CONFIRMED ({self._consecutive_frames} frames) — "
+            f"position: {_POSITION_LABELS[position]}, area: {area:.0f}px² "
+            f"(cx={best.bbox.center.position.x:.0f}, score={best.score:.2f})"
         )
 
         # Reset counter so we don't spam every frame after confirmation
         self._consecutive_count = 0
 
+
 # ════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
+# Entry point
 # ════════════════════════════════════════════════════════════════════════
 
 def main(args=None):
